@@ -1,3 +1,4 @@
+/// <reference types="vite/client" />
 /**
  * File Index Service GUI - メインアプリケーション
  * - 検索テスト
@@ -11,7 +12,7 @@ import PathManager from './components/PathManager'
 import IgnoreManager from './components/IgnoreManager'
 import SearchTest from './components/SearchTest'
 
-const API_BASE = 'http://localhost:8080'
+const API_BASE = import.meta.env.DEV ? 'http://localhost:8080' : ''
 
 interface ServiceStatus {
   ready: boolean

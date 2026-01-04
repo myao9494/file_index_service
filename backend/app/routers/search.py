@@ -112,7 +112,19 @@ async def search(
             }
         )
     else:
-        # HTML形式（シンプルなテーブル）
+        # JSON以外の場合
+        # 1. 静的ファイルとしてビルドされたReactアプリ(index.html)があればそれを返す
+        # 2. なければ従来の簡易HTMLを返す
+        import os
+        from fastapi.responses import FileResponse
+        
+        static_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "static")
+        index_html = os.path.join(static_dir, "index.html")
+        
+        if os.path.exists(index_html):
+            return FileResponse(index_html)
+
+        # HTML形式（シンプルなテーブル - 従来のフォールバック）
         html = """
 <!DOCTYPE html>
 <html>

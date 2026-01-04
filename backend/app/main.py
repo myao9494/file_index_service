@@ -138,6 +138,16 @@ app.add_middleware(
 app.include_router(search.router)
 app.include_router(admin.router, prefix="", tags=["admin"])
 
+import os
+from fastapi.staticfiles import StaticFiles
+
+# 静的ファイルのパス
+STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+
+# 静的ファイルが存在する場合のみマウント
+if os.path.exists(STATIC_DIR):
+    app.mount("/assets", StaticFiles(directory=os.path.join(STATIC_DIR, "assets")), name="assets")
+
 
 if __name__ == "__main__":
     import uvicorn
