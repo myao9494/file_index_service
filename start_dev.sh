@@ -1,13 +1,14 @@
 #!/bin/bash
 #
-# File Index Service 起動スクリプト (PWA版)
-# フロントエンドをビルドしてバックエンドから静的ファイルとして配信
+# File Index Service 起動スクリプト
+# バックエンドとフロントエンドを同時に起動
 #
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKEND_PORT=8080
+FRONTEND_PORT=5174
 
 # 色付き出力
 RED='\033[0;31m'
@@ -35,24 +36,7 @@ check_port() {
 
 # ポートチェック
 check_port $BACKEND_PORT
-
-# フロントエンドのビルド
-echo -e "${GREEN}フロントエンド(PWA)をビルド中...${NC}"
-cd "$SCRIPT_DIR/frontend"
-
-if [ ! -d "node_modules" ]; then
-    echo -e "${YELLOW}フロントエンドの依存関係をインストール中...${NC}"
-    npm install
-fi
-
-echo -e "${YELLOW}ビルド実行中...${NC}"
-npm run build
-
-# ビルド結果の配置
-echo -e "${GREEN}ビルド結果をバックエンドに配置中...${NC}"
-rm -rf "$SCRIPT_DIR/backend/static"
-mkdir -p "$SCRIPT_DIR/backend/static"
-cp -R "$SCRIPT_DIR/frontend/dist/"* "$SCRIPT_DIR/backend/static/"
+check_port $FRONTEND_PORT
 
 # バックエンド起動
 echo -e "${GREEN}バックエンドを起動中... (ポート $BACKEND_PORT)${NC}"
@@ -65,12 +49,39 @@ if [ ! -d ".venv" ] || [ ! -f ".venv/bin/python" ]; then
     ./.venv/bin/pip install -r requirements.txt
 fi
 
+PYTHONPATH=. ./.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port $BACKEND_PORT &
+BACKEND_PID=$!
+
+# フロントエンド起動
+echo -e "${GREEN}フロントエンドを起動中... (ポート $FRONTEND_PORT)${NC}"
+cd "$SCRIPT_DIR/frontend"
+
+if [ ! -d "node_modules" ]; then
+    echo -e "${YELLOW}依存関係をインストール中...${NC}"
+    npm install
+fi
+
+npm run dev &
+FRONTEND_PID=$!
+
+# クリーンアップ関数
+cleanup() {
+    echo -e "\n${YELLOW}サービスを停止中...${NC}"
+    kill $BACKEND_PID 2>/dev/null || true
+    kill $FRONTEND_PID 2>/dev/null || true
+    echo -e "${GREEN}停止完了${NC}"
+    exit 0
+}
+
+trap cleanup SIGINT SIGTERM
+
 echo -e ""
 echo -e "${GREEN}=== サービス起動完了 ===${NC}"
-echo -e "アクセス(PWA/管理GUI/API): ${YELLOW}http://localhost:$BACKEND_PORT${NC}"
+echo -e "管理GUI:  ${YELLOW}http://localhost:$FRONTEND_PORT${NC}"
+echo -e "API:      ${YELLOW}http://localhost:$BACKEND_PORT${NC}"
 echo -e ""
 echo -e "停止: Ctrl+C"
 echo -e ""
 
-# Uvicornの実行 (現在のプロセスを置き換える)
-PYTHONPATH=. exec ./.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port $BACKEND_PORT
+# プロセス待機
+wait

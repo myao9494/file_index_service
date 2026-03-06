@@ -146,7 +146,13 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
 
 # 静的ファイルが存在する場合のみマウント
 if os.path.exists(STATIC_DIR):
-    app.mount("/assets", StaticFiles(directory=os.path.join(STATIC_DIR, "assets")), name="assets")
+    # assetsディレクトリが存在する場合はマウント
+    assets_dir = os.path.join(STATIC_DIR, "assets")
+    if os.path.exists(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+    
+    # ルートディレクトリもマウント（PWAのmanifestやsw.jsなどのため）
+    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static_root")
 
 
 if __name__ == "__main__":

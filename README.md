@@ -33,7 +33,7 @@ npm install
 cd backend
 PYTHONPATH=. python -m uvicorn app.main:app --reload --port 8080
 
-# フロントエンド（ポート5174）
+# フロントエンド（ポート  11）
 cd frontend
 npm run dev
 ```
