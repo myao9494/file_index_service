@@ -42,10 +42,12 @@ File Index ServiceはEverything互換のファイルインデックス検索サ�
 │                          data/                                      │
 │  ┌───────────────────────────┐                                     │
 │  │    file_index.db          │                                     │
-│  │  - files テーブル         │                                     │
-│  │  - files_fts (FTS5)       │                                     │
-│  │  - files_bigram           │                                     │
+│  │  - file_metadata          │                                     │
+│  │  - file_index (FTS5)      │                                     │
+│  │  - file_name_index        │                                     │
+│  │  - file_name_bigrams      │                                     │
 │  │  - watch_paths            │                                     │
+│  │  - ignore_patterns        │                                     │
 │  └───────────────────────────┘                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -76,6 +78,10 @@ Everything HTTPサーバーと同じパラメータをサポート:
 | GET /paths | 監視パス一覧 |
 | POST /paths | パス追加 |
 | DELETE /paths | パス削除 |
+| GET /ignores | 除外パターン一覧 |
+| POST /ignores | 除外パターン追加 |
+| DELETE /ignores | 除外パターン削除 |
+| POST /ignores/defaults | 既定除外パターン追加 |
 | POST /rebuild | インデックス再構築 |
 
 ### 2. index_service.py
@@ -85,29 +91,37 @@ SQLite FTS5を使用した高速検索エンジン。
 **テーブル構造:**
 ```sql
 -- メインファイルテーブル
-CREATE TABLE files (
+CREATE TABLE file_metadata (
     id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
     path TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    parent_path TEXT NOT NULL,
     type TEXT NOT NULL,
-    size INTEGER DEFAULT 0,
-    date_modified REAL DEFAULT 0,
-    parent_path TEXT
+    extension TEXT,
+    size INTEGER,
+    mtime REAL,
+    indexed_at REAL
 );
 
--- FTS5インデックス（トリグラム）
-CREATE VIRTUAL TABLE files_fts USING fts5(
-    name, path,
-    content='files',
+-- Everything互換向け FTS5
+CREATE VIRTUAL TABLE file_index USING fts5(
+    path, name, parent_path,
+    content='file_metadata',
+    content_rowid='id',
+);
+
+-- 3文字以上の部分一致検索向け trigram インデックス
+CREATE VIRTUAL TABLE file_name_index USING fts5(
+    name,
+    content='file_metadata',
     content_rowid='id',
     tokenize='trigram'
 );
 
--- バイグラムインデックス
-CREATE TABLE files_bigram (
-    file_id INTEGER,
-    bigram TEXT,
-    position INTEGER
+-- 2文字検索向けバイグラムインデックス
+CREATE TABLE file_name_bigrams (
+    file_id INTEGER NOT NULL,
+    bigram TEXT NOT NULL
 );
 ```
 
@@ -118,6 +132,12 @@ CREATE TABLE files_bigram (
 | 2文字 | bigram テーブル |
 | 1文字 | LIKE検索 |
 
+**検索最適化:**
+- `depth` 未指定時は SQLite の `LIMIT/OFFSET` をそのまま使い、不要な行の取り込みを避ける
+- 無視パターンはメモリ上でキャッシュし、watcher の高頻度判定で毎回DBを引かない
+- バッチINSERTは positional parameter を使い、辞書再構築コストを減らす
+- bigram は SQLite trigger で追従更新し、2文字検索でも追加直後の整合性を保つ
+
 ### 3. scanner.py
 
 並列ファイルスキャナー。ThreadPoolExecutorで高速スキャン。
@@ -127,6 +147,11 @@ CREATE TABLE files_bigram (
 max_workers: 4  # 並列ワーカー数
 batch_size: 1000  # バッチ処理サイズ
 ```
+
+**高速化方針:**
+- `os.scandir()` を使い、`stat()` とディレクトリ判定を `DirEntry` ベースでまとめて取得する
+- ルート直下の項目も即座にバッチ投入し、再走査や取りこぼしを防ぐ
+- サブディレクトリ単位の並列化は維持しつつ、バッチ flush を共通化して無駄なコピーを抑える
 
 ### 4. watcher.py
 
@@ -145,15 +170,17 @@ on_moved → パス更新
 ### 1. インデックス構築フロー
 
 ```
-[監視パス追加]
+[起動 or 監視パス追加]
     ↓
 [scanner.py] 並列スキャン開始
     ↓
 [index_service.py] バッチ挿入
     ↓
+[index_service.py] trigram / bigram 再構築
+    ↓
 [watcher.py] 監視開始
     ↓
-[ready: true] インデックス完了
+[status=watching] インデックス完了
 ```
 
 ### 2. 検索フロー
@@ -215,4 +242,6 @@ on_moved → パス更新
 | file_manager Backend | 8001 | ファイル操作API |
 | file_manager Frontend | 5173 | ファイルマネージャーUI |
 | File Index Service Backend | 8080 | インデックス検索API |
-| File Index Service Frontend | 5174 | 管理GUI |
+| File Index Service Frontend | 5174 | 開発時の管理GUI |
+
+本番/PWAモードでは、バックエンドが `8080` で管理GUIとAPIを同時に配信します。

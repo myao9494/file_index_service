@@ -27,7 +27,7 @@
 
 ## 注意事項
 
-- 本番モードでは、API (`/status`, `/search`, etc.) はルートパス (`/`) と同じオリジンで提供されます。
+- 本番モードでは、API (`/status`, `/paths`, `/ignores`, `/?search=...&json=1` など) はルートパス (`/`) と同じオリジンで提供されます。
 - `http://localhost:8080` にアクセスすると、React製の管理画面が表示されます。
 - `http://localhost:8080/?search=...&json=1` でJSON APIにアクセスできます（Everything互換）。
 - `http://localhost:8080/?search=...` (jsonなし) は管理画面 (`index.html`) を返します。

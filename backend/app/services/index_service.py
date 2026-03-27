@@ -7,7 +7,7 @@
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 import fnmatch
 import threading
 
@@ -26,6 +26,7 @@ class IndexService:
         self._trigram_available: Optional[bool] = None  # trigramインデックスの利用可否キャッシュ
         # 書き込み操作を直列化するためのロック
         self._lock = threading.Lock()
+        self._ignore_matchers_cache: Optional[List[Tuple[str, bool]]] = None
 
     def _get_connection(self) -> sqlite3.Connection:
         """データベース接続を取得（スレッドセーフ）"""
@@ -34,8 +35,9 @@ class IndexService:
                 self.db_path, check_same_thread=False, timeout=30.0
             )  # check_same_thread=Falseは不要だが念のため
             self._local.conn.row_factory = sqlite3.Row
-            # WALモードをスレッドごとに有効化（必要であれば）
+            # 読み書き競合を避けつつ、検索とバッチ更新を高速化する
             self._local.conn.execute("PRAGMA journal_mode = WAL")
+            self._local.conn.execute("PRAGMA synchronous = NORMAL")
         return self._local.conn
 
     def init_db(self) -> None:
@@ -181,6 +183,52 @@ class IndexService:
         """
         )
 
+        # bigramインデックス用のトリガー
+        cursor.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS file_metadata_ai_bigram AFTER INSERT ON file_metadata BEGIN
+                INSERT INTO file_name_bigrams(file_id, bigram)
+                WITH RECURSIVE seq(i) AS (
+                    SELECT 1
+                    UNION ALL
+                    SELECT i + 1 FROM seq
+                    WHERE i < length(new.name) - 1
+                )
+                SELECT new.id, substr(new.name, i, 2)
+                FROM seq
+                WHERE length(new.name) >= 2
+                GROUP BY substr(new.name, i, 2);
+            END
+        """
+        )
+
+        cursor.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS file_metadata_ad_bigram AFTER DELETE ON file_metadata BEGIN
+                DELETE FROM file_name_bigrams WHERE file_id = old.id;
+            END
+        """
+        )
+
+        cursor.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS file_metadata_au_bigram AFTER UPDATE ON file_metadata BEGIN
+                DELETE FROM file_name_bigrams WHERE file_id = old.id;
+                INSERT INTO file_name_bigrams(file_id, bigram)
+                WITH RECURSIVE seq(i) AS (
+                    SELECT 1
+                    UNION ALL
+                    SELECT i + 1 FROM seq
+                    WHERE i < length(new.name) - 1
+                )
+                SELECT new.id, substr(new.name, i, 2)
+                FROM seq
+                WHERE length(new.name) >= 2
+                GROUP BY substr(new.name, i, 2);
+            END
+        """
+        )
+
         # FTS5トリガー（メタデータテーブルと同期）
         cursor.execute(
             """
@@ -316,14 +364,27 @@ class IndexService:
             cursor = conn.cursor()
 
             indexed_at = time.time()
+            rows = [
+                (
+                    f["path"],
+                    f["name"],
+                    f["parent_path"],
+                    f["file_type"],
+                    f["extension"],
+                    f["size"],
+                    f["mtime"],
+                    indexed_at,
+                )
+                for f in files
+            ]
 
             cursor.executemany(
                 """
                 INSERT OR REPLACE INTO file_metadata
                 (path, name, parent_path, type, extension, size, mtime, indexed_at)
-                VALUES (:path, :name, :parent_path, :file_type, :extension, :size, :mtime, :indexed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-                [{**f, "indexed_at": indexed_at} for f in files],
+                rows,
             )
             conn.commit()
 
@@ -561,13 +622,13 @@ class IndexService:
             sql += f" ORDER BY {sort_column} {sort_direction}"
 
         # 結果数制限
-        # depthフィルタがある場合はSQLでLIMITをかけず（多めに取得）、後でフィルタリングする
-        limit_count = max_results + offset
+        # depthフィルタがある場合はSQLでOFFSETを使わず、階層評価後に適用する
         if depth > 0 and path_filter:
-            limit_count = 100000  # 十分に大きな値
-
-        sql += " LIMIT ?"
-        params.append(limit_count)
+            sql += " LIMIT ?"
+            params.append(100000)  # 十分に大きな値
+        else:
+            sql += " LIMIT ? OFFSET ?"
+            params.extend([max_results, offset])
 
         cursor.execute(sql, params)
         rows = cursor.fetchall()
@@ -595,10 +656,11 @@ class IndexService:
                 except (ValueError, RuntimeError):
                     continue
 
-            # オフセット処理
-            if skipped < offset:
-                skipped += 1
-                continue
+            if depth > 0 and path_filter:
+                # オフセット処理
+                if skipped < offset:
+                    skipped += 1
+                    continue
 
             results.append(result_dict)
 
@@ -807,6 +869,7 @@ class IndexService:
                 "INSERT OR IGNORE INTO ignore_patterns (pattern) VALUES (?)", (pattern,)
             )
             conn.commit()
+            self._ignore_matchers_cache = None
 
     def remove_ignore_pattern(self, pattern: str) -> None:
         """無視パターンを削除"""
@@ -815,6 +878,7 @@ class IndexService:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM ignore_patterns WHERE pattern = ?", (pattern,))
             conn.commit()
+            self._ignore_matchers_cache = None
 
     def get_ignore_patterns(self) -> List[str]:
         """無視パターン一覧を取得"""
@@ -833,25 +897,37 @@ class IndexService:
         Returns:
             無視対象であれば True
         """
-        patterns = self.get_ignore_patterns()
-        if not patterns:
+        matchers = self._get_ignore_matchers()
+        if not matchers:
             return False
 
         path_obj = Path(path)
         path_str = str(path_obj)
         parts = path_obj.parts
 
-        for pattern in patterns:
+        for pattern, match_parts in matchers:
             # 1. 単純なglobマッチング (フルパスに対して)
             if fnmatch.fnmatch(path_str, pattern):
                 return True
-            
+
             # 2. ファイル名/ディレクトリ名単体でのマッチング (例: node_modules, .git)
             # パスの一部にパターンにマッチするものがあれば除外とする
             # ただし、パターンがセパレータを含まない場合のみ有効 (例: "src/foo" は部分一致させない)
-            if "/" not in pattern and "\\" not in pattern:
+            if match_parts:
                 for part in parts:
                     if fnmatch.fnmatch(part, pattern):
                         return True
-                        
+
         return False
+
+    def _get_ignore_matchers(self) -> Sequence[Tuple[str, bool]]:
+        """無視パターンの評価用キャッシュを取得"""
+        if self._ignore_matchers_cache is not None:
+            return self._ignore_matchers_cache
+
+        patterns = self.get_ignore_patterns()
+        self._ignore_matchers_cache = [
+            (pattern, "/" not in pattern and "\\" not in pattern)
+            for pattern in patterns
+        ]
+        return self._ignore_matchers_cache

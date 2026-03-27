@@ -6,6 +6,7 @@
 """
 import asyncio
 import fnmatch
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,34 +68,55 @@ class ParallelScanner:
                 return True
         return False
 
+    @staticmethod
+    def _create_file_info(entry: os.DirEntry) -> Optional[FileInfo]:
+        """DirEntryからFileInfoを構築する"""
+        try:
+            stat = entry.stat(follow_symlinks=False)
+            is_dir = entry.is_dir(follow_symlinks=False)
+        except (PermissionError, OSError):
+            return None
+
+        entry_path = Path(entry.path)
+        return FileInfo(
+            path=entry.path,
+            name=entry.name,
+            parent_path=str(entry_path.parent),
+            file_type="directory" if is_dir else "file",
+            extension=entry_path.suffix if not is_dir else None,
+            size=0 if is_dir else stat.st_size,
+            mtime=stat.st_mtime,
+        )
+
+    def _flush_batch(
+        self,
+        batch: List[FileInfo],
+        on_batch: Optional[Callable[[List[FileInfo]], None]],
+    ) -> List[FileInfo]:
+        """一定件数以上のバッチをコールバックへ渡す"""
+        if on_batch is None:
+            return batch
+
+        while len(batch) >= self.batch_size:
+            on_batch(batch[: self.batch_size])
+            batch = batch[self.batch_size :]
+
+        return batch
+
     def _scan_directory_sync(self, path: Path) -> List[FileInfo]:
         """ディレクトリを同期的にスキャン（単一ディレクトリのみ）"""
         results: List[FileInfo] = []
 
         try:
-            for item in path.iterdir():
-                # 除外パターンチェック
-                if self._should_ignore(item):
-                    continue
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    item_path = Path(entry.path)
+                    if self._should_ignore(item_path):
+                        continue
 
-                try:
-                    stat = item.stat()
-                    is_dir = item.is_dir()
-
-                    file_info = FileInfo(
-                        path=str(item),
-                        name=item.name,
-                        parent_path=str(item.parent),
-                        file_type="directory" if is_dir else "file",
-                        extension=item.suffix if not is_dir else None,
-                        size=0 if is_dir else stat.st_size,
-                        mtime=stat.st_mtime,
-                    )
-                    results.append(file_info)
-
-                except (PermissionError, OSError):
-                    # 権限エラーやその他のOSエラーはスキップ
-                    continue
+                    file_info = self._create_file_info(entry)
+                    if file_info is not None:
+                        results.append(file_info)
 
         except (PermissionError, OSError):
             # ディレクトリ自体へのアクセスエラー
@@ -109,32 +131,20 @@ class ParallelScanner:
     ) -> None:
         """ディレクトリを再帰的に同期スキャン"""
         try:
-            for item in path.iterdir():
-                # 除外パターンチェック
-                if self._should_ignore(item):
-                    continue
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    item_path = Path(entry.path)
+                    if self._should_ignore(item_path):
+                        continue
 
-                try:
-                    stat = item.stat()
-                    is_dir = item.is_dir()
+                    file_info = self._create_file_info(entry)
+                    if file_info is None:
+                        continue
 
-                    file_info = FileInfo(
-                        path=str(item),
-                        name=item.name,
-                        parent_path=str(item.parent),
-                        file_type="directory" if is_dir else "file",
-                        extension=item.suffix if not is_dir else None,
-                        size=0 if is_dir else stat.st_size,
-                        mtime=stat.st_mtime,
-                    )
                     results.append(file_info)
 
-                    # ディレクトリの場合は再帰
-                    if is_dir:
-                        self._scan_recursive_sync(item, results)
-
-                except (PermissionError, OSError):
-                    continue
+                    if file_info.file_type == "directory":
+                        self._scan_recursive_sync(item_path, results)
 
         except (PermissionError, OSError):
             pass
@@ -170,37 +180,31 @@ class ParallelScanner:
         try:
             subdirs: List[Path] = []
             direct_items: List[FileInfo] = []
+            batch: List[FileInfo] = []
 
-            for item in path.iterdir():
-                if self._should_ignore(item):
-                    continue
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    item_path = Path(entry.path)
+                    if self._should_ignore(item_path):
+                        continue
 
-                try:
-                    stat = item.stat()
-                    is_dir = item.is_dir()
+                    file_info = self._create_file_info(entry)
+                    if file_info is None:
+                        continue
 
-                    file_info = FileInfo(
-                        path=str(item),
-                        name=item.name,
-                        parent_path=str(item.parent),
-                        file_type="directory" if is_dir else "file",
-                        extension=item.suffix if not is_dir else None,
-                        size=0 if is_dir else stat.st_size,
-                        mtime=stat.st_mtime,
-                    )
                     direct_items.append(file_info)
+                    batch.append(file_info)
 
-                    if is_dir:
-                        subdirs.append(item)
-
-                except (PermissionError, OSError):
-                    continue
+                    if file_info.file_type == "directory":
+                        subdirs.append(item_path)
 
             all_results.extend(direct_items)
             scanned_count += len(direct_items)
 
             if on_progress:
                 on_progress(scanned_count, -1)  # totalは不明なので-1
+
+            batch = self._flush_batch(batch, on_batch)
 
         except (PermissionError, OSError):
             return all_results
@@ -221,8 +225,6 @@ class ParallelScanner:
                 ]
 
                 # 結果を収集
-                batch: List[FileInfo] = []
-
                 for future in asyncio.as_completed(futures):
                     try:
                         subdir_results = await future
@@ -235,9 +237,7 @@ class ParallelScanner:
                         # バッチ処理
                         if on_batch:
                             batch.extend(subdir_results)
-                            while len(batch) >= self.batch_size:
-                                on_batch(batch[: self.batch_size])
-                                batch = batch[self.batch_size :]
+                            batch = self._flush_batch(batch, on_batch)
 
                     except Exception:
                         # エラーは無視して続行
